@@ -1,0 +1,26 @@
+# Output files
+*_chinify_*.xlsx
+VIDALTA_chinify_*.xlsx
+
+# Debug / audit images
+audit_*.jpg
+debug_*.jpg
+render_*.jpg
+
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+~$*
+
+# Temp Excel locks
+~$*.xlsx
