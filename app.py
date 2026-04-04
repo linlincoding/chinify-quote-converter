@@ -13,10 +13,9 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 
 from convert_quote import (
-    get_product_rows_with_yranges,
+    claude_extract_all_pages,
+    annotate_yranges,
     extract_and_match_images,
-    render_pdf_page,
-    claude_clean,
     write_excel,
     MODEL,
 )
@@ -86,16 +85,18 @@ def extract_from_excel(excel_path: str) -> list[dict]:
     text = _read_excel_as_text(excel_path)
     client = anthropic.Anthropic(api_key=api_key)
 
-    resp = client.messages.create(
+    with client.messages.stream(
         model=MODEL,
         max_tokens=4000,
+        thinking={"type": "adaptive"},
         messages=[{
             "role": "user",
             "content": EXCEL_EXTRACT_PROMPT.format(data=text),
         }]
-    )
+    ) as stream:
+        resp = stream.get_final_message()
 
-    raw = resp.content[0].text.strip()
+    raw = next(b.text for b in resp.content if b.type == "text").strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -137,21 +138,18 @@ def convert_file(uploaded_file, use_claude_clean: bool, status) -> tuple[bytes |
 
         # ── Extract products ────────────────────────────────────────────────
         if suffix == ".pdf":
-            status.write("📄 Parsing PDF table...")
-            products = get_product_rows_with_yranges(in_path)
-            status.write(f"✓ Found **{len(products)}** products")
+            status.write("🤖 Claude Vision: reading all pages...")
+            products = claude_extract_all_pages(in_path)
+            status.write(f"✓ Found **{len(products)}** products across all pages")
+
+            status.write("📐 Locating row positions for image matching...")
+            products = annotate_yranges(in_path, products)
 
             status.write("🖼 Extracting & matching images...")
             products = extract_and_match_images(in_path, products)
             n_photo  = sum(1 for p in products if p.get("photo"))
             n_swatch = sum(1 for p in products if p.get("swatches"))
             status.write(f"✓ Photos: {n_photo}  |  Swatches: {n_swatch}")
-
-            if use_claude_clean and os.environ.get("ANTHROPIC_API_KEY"):
-                status.write("🤖 Claude: cleaning up text data...")
-                png = render_pdf_page(in_path)
-                products = claude_clean(products, png)
-                status.write("✓ Text cleaned")
 
         elif suffix in (".xlsx", ".xls"):
             status.write("📊 Sending Excel to Claude for extraction...")
@@ -212,11 +210,8 @@ def main():
         label_visibility="collapsed",
     )
 
-    use_claude = st.checkbox(
-        "AI text cleanup (recommended for PDF)",
-        value=True,
-        help="Send the PDF page to Claude Vision to fix OCR/parsing errors in product names and dimensions.",
-    )
+    # Claude Vision is always used for PDF extraction (no longer optional)
+    use_claude = True
 
     if not uploaded:
         st.markdown(
