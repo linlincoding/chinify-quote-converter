@@ -90,48 +90,73 @@ Return ONLY a valid JSON array. No markdown, no explanation.
 """
 
 
+BATCH_SIZE = 3   # pages per Claude call — keeps token usage manageable
+
+
+def _call_claude_batch(client, page_images: list[tuple[int, bytes]]) -> list[dict]:
+    """
+    Send a batch of (page_num, png_bytes) to Claude and return extracted products.
+    page_num is 1-indexed (absolute page number in the full document).
+    """
+    content = []
+    for page_num, png_bytes in page_images:
+        png_b64 = base64.standard_b64encode(png_bytes).decode()
+        content.append({"type": "text", "text": f"=== PAGE {page_num} ==="})
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": png_b64},
+        })
+    content.append({"type": "text", "text": EXTRACT_PROMPT})
+
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=8000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    text_blocks = [b.text for b in resp.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(
+            f"Claude returned no text (batch pages {[p for p,_ in page_images]}). "
+            f"Stop reason: {resp.stop_reason}"
+        )
+
+    raw = text_blocks[0].strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
 def claude_extract_all_pages(pdf_path: str) -> list[dict]:
     """
-    Render ALL PDF pages and send to Claude Vision for structured extraction.
+    Render ALL PDF pages and extract products via Claude Vision.
+    Processes in batches of BATCH_SIZE pages to stay within token limits.
     Works with any PDF format, any number of pages, any language.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
 
+    # Render all pages at 96 DPI — sufficient for text, lower token usage
     doc = fitz.open(pdf_path)
-    content = []
-
+    mat = fitz.Matrix(96 / 72, 96 / 72)
+    page_images = []
     for i in range(len(doc)):
-        pix = doc[i].get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False)
-        png_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
-        content.append({"type": "text", "text": f"=== PAGE {i + 1} ==="})
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": png_b64},
-        })
+        pix = doc[i].get_pixmap(matrix=mat, alpha=False)
+        page_images.append((i + 1, pix.tobytes("png")))   # 1-indexed page num
     doc.close()
 
-    content.append({"type": "text", "text": EXTRACT_PROMPT})
-
     client = anthropic.Anthropic(api_key=api_key)
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        messages=[{"role": "user", "content": content}],
-    )
+    all_products: list[dict] = []
 
-    text_blocks = [b.text for b in resp.content if b.type == "text"]
-    if not text_blocks:
-        raise RuntimeError(f"Claude returned no text. Stop reason: {resp.stop_reason}. "
-                           f"Content types: {[b.type for b in resp.content]}")
-    raw = text_blocks[0].strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    for batch_start in range(0, len(page_images), BATCH_SIZE):
+        batch = page_images[batch_start: batch_start + BATCH_SIZE]
+        page_nums = [p for p, _ in batch]
+        print(f"  Extracting pages {page_nums}...")
+        products = _call_claude_batch(client, batch)
+        all_products.extend(products)
 
-    products = json.loads(raw)
-
-    for p in products:
+    for p in all_products:
         p.setdefault("area", "")
         p.setdefault("code", "")
         p.setdefault("product", "")
@@ -145,7 +170,7 @@ def claude_extract_all_pages(pdf_path: str) -> list[dict]:
         p["photo"] = None
         p["extra_materials"] = []
 
-    return products
+    return all_products
 
 
 # ══════════════════════════════════════════════════════════════════════════════
