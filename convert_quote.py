@@ -115,15 +115,17 @@ def claude_extract_all_pages(pdf_path: str) -> list[dict]:
     content.append({"type": "text", "text": EXTRACT_PROMPT})
 
     client = anthropic.Anthropic(api_key=api_key)
-    with client.messages.stream(
+    resp = client.messages.create(
         model=MODEL,
-        max_tokens=8000,
-        thinking={"type": "adaptive"},
+        max_tokens=16000,
         messages=[{"role": "user", "content": content}],
-    ) as stream:
-        resp = stream.get_final_message()
+    )
 
-    raw = next(b.text for b in resp.content if b.type == "text").strip()
+    text_blocks = [b.text for b in resp.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(f"Claude returned no text. Stop reason: {resp.stop_reason}. "
+                           f"Content types: {[b.type for b in resp.content]}")
+    raw = text_blocks[0].strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
