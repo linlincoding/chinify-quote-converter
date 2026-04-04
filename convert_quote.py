@@ -291,14 +291,16 @@ def extract_and_match_images(pdf_path: str, products: list[dict]) -> list[dict]:
             left_hits  = [i for i in hits if i["xc"] < page_w * 0.45]
             right_hits = [i for i in hits if i["xc"] >= page_w * 0.45]
 
-            if left_hits:
+            if left_hits and right_hits:
+                # Two-column layout (e.g. VIDALTA): left=photo, right=swatches
+                p["photo"] = max(left_hits, key=lambda x: x["size"])["data"]
+                for hit in sorted(right_hits, key=lambda x: x["yc"]):
+                    p["swatches"].append(hit["data"])
+            elif left_hits:
                 p["photo"] = max(left_hits, key=lambda x: x["size"])["data"]
             elif right_hits:
-                # Single-column PDFs: centre image → photo
+                # Single PICTURE column (BOQ style): centre/right image → photo only
                 p["photo"] = max(right_hits, key=lambda x: x["size"])["data"]
-
-            for hit in sorted(right_hits, key=lambda x: x["yc"]):
-                p["swatches"].append(hit["data"])
 
         # ── Pass 2: render fallback for rows with no embedded image ──────────
         for p in page_prods:
