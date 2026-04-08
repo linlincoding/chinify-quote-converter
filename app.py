@@ -14,8 +14,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from convert_quote import (
     claude_extract_all_pages,
+    claude_extract_from_image,
     annotate_yranges,
     extract_and_match_images,
+    score_products,
     write_excel,
     MODEL,
 )
@@ -115,6 +117,8 @@ def extract_from_excel(excel_path: str) -> list[dict]:
         p.setdefault("y1", 0)
         p.setdefault("swatches", [])
         p.setdefault("photo", None)
+        p.setdefault("page", 1)
+        p["source_type"] = "excel"
 
     return products
 
@@ -122,10 +126,10 @@ def extract_from_excel(excel_path: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # Core conversion — PDF or Excel → product list → Chinify Excel bytes
 # ══════════════════════════════════════════════════════════════════════════════
-def convert_file(uploaded_file, use_claude_clean: bool, status) -> tuple[bytes | None, list]:
+def convert_file(uploaded_file, use_claude_clean: bool, status) -> tuple[bytes | None, list, dict]:
     """
     Process an uploaded Streamlit file object.
-    Returns (excel_bytes, products) or (None, []) on failure.
+    Returns (excel_bytes, products, summary) or (None, [], {}) on failure.
     """
     suffix = Path(uploaded_file.name).suffix.lower()
 
@@ -155,12 +159,36 @@ def convert_file(uploaded_file, use_claude_clean: bool, status) -> tuple[bytes |
             status.write("📊 Sending Excel to Claude for extraction...")
             products = extract_from_excel(in_path)
             if not products:
-                return None, []
+                return None, [], {}
+            status.write(f"✓ Found **{len(products)}** products")
+
+        elif suffix in (".png", ".jpg", ".jpeg"):
+            status.write("🖼 Reading screenshot/photo with Claude Vision...")
+            products = claude_extract_from_image(in_path)
+            if not products:
+                return None, [], {}
             status.write(f"✓ Found **{len(products)}** products")
 
         else:
             st.error(f"Unsupported file type: {suffix}")
-            return None, []
+            return None, [], {}
+
+        status.write("🧠 Scoring rows for manual review...")
+        products = score_products(products)
+        review_count = sum(1 for p in products if p.get("needs_review"))
+        avg_confidence = (
+            sum(p.get("confidence", 0.0) for p in products) / len(products)
+            if products else 0.0
+        )
+        summary = {
+            "product_count": len(products),
+            "review_count": review_count,
+            "avg_confidence": avg_confidence,
+        }
+        status.write(
+            f"✓ Review queue: {review_count} row(s)  |  "
+            f"Average confidence: {avg_confidence:.0%}"
+        )
 
         # ── Write Chinify Excel ──────────────────────────────────────────────
         status.write("📝 Writing Chinify Excel format...")
@@ -168,7 +196,7 @@ def convert_file(uploaded_file, use_claude_clean: bool, status) -> tuple[bytes |
         status.write("✓ Excel generated")
 
         with open(out_path, "rb") as f:
-            return f.read(), products
+            return f.read(), products, summary
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -205,8 +233,8 @@ def main():
     # ── Upload & options ──────────────────────────────────────────────────────
     uploaded = st.file_uploader(
         "Upload client quote",
-        type=["pdf", "xlsx", "xls"],
-        help="Any PDF or Excel format is accepted.",
+        type=["pdf", "xlsx", "xls", "png", "jpg", "jpeg"],
+        help="PDF, Excel, or a screenshot/photo of the quote.",
         label_visibility="collapsed",
     )
 
@@ -217,8 +245,14 @@ def main():
         st.markdown(
             """
             **Supported inputs:**
-            - 📄 PDF — any single-page furniture quote PDF
+            - 📄 PDF — client quote PDFs
             - 📊 Excel (`.xlsx` / `.xls`) — any client template format
+            - 🖼 Image (`.png` / `.jpg` / `.jpeg`) — screenshots or photos
+
+            **Recommended workflow:**
+            - Let AI prefill the Chinify template
+            - Review only the rows marked as risky
+            - Treat this as a time-saver, not a zero-check autopilot
             """
         )
         return
@@ -230,10 +264,11 @@ def main():
     if st.button("🔄 Convert", type="primary", use_container_width=True):
         output_bytes = None
         products = []
+        summary = {}
 
         with st.status("Converting…", expanded=True) as status:
             try:
-                output_bytes, products = convert_file(uploaded, use_claude, status)
+                output_bytes, products, summary = convert_file(uploaded, use_claude, status)
                 if output_bytes:
                     status.update(label="Conversion complete ✅", state="complete", expanded=False)
                 else:
@@ -243,6 +278,17 @@ def main():
                 st.exception(e)
 
         if output_bytes and products:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Products", summary.get("product_count", len(products)))
+            col2.metric("Needs review", summary.get("review_count", 0))
+            col3.metric("Avg confidence", f"{summary.get('avg_confidence', 0):.0%}")
+
+            review_rows = [p for p in products if p.get("needs_review")]
+            if review_rows:
+                st.warning(
+                    f"{len(review_rows)} row(s) should be checked before sending to factory."
+                )
+
             # ── Product preview table ─────────────────────────────────────
             with st.expander("📋 Preview extracted products", expanded=True):
                 rows = []
@@ -253,10 +299,27 @@ def main():
                         "Qty":      p.get("qty",     ""),
                         "Dims":     p.get("dims",    ""),
                         "Material": p.get("material",""),
+                        "Confidence": f"{p.get('confidence', 0):.0%}",
+                        "Review":   "Yes" if p.get("needs_review") else "",
                         "Photo":    "✓" if p.get("photo") else "",
                         "Swatch":   f"{len(p.get('swatches',[]))}x" if p.get("swatches") else "",
                     })
                 st.dataframe(rows, use_container_width=True, hide_index=True)
+
+            if review_rows:
+                with st.expander("🛠 Rows that need manual review", expanded=True):
+                    review_table = []
+                    for p in review_rows:
+                        review_table.append({
+                            "Product": p.get("product", ""),
+                            "Code": p.get("code", ""),
+                            "Qty": p.get("qty", ""),
+                            "Dims": p.get("dims", ""),
+                            "Material": p.get("material", ""),
+                            "Confidence": f"{p.get('confidence', 0):.0%}",
+                            "Why review": " | ".join(p.get("review_reasons", [])),
+                        })
+                    st.dataframe(review_table, use_container_width=True, hide_index=True)
 
             # ── Download ──────────────────────────────────────────────────
             out_name = Path(uploaded.name).stem + "_chinify.xlsx"

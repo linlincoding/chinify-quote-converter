@@ -89,8 +89,57 @@ Rules:
 Return ONLY a valid JSON array. No markdown, no explanation.
 """
 
+IMAGE_EXTRACT_PROMPT = """You are a furniture quote extractor.
+
+I am showing you a client quote as one screenshot or photo.
+Extract every furniture/product line you can see and return them as a JSON array.
+
+Each item must have these exact fields:
+  "code"     — product code/SKU. Use "" if none.
+  "product"  — product name. Use "" if none.
+  "qty"      — quantity as a string. Use "" if none.
+  "area"     — room/zone name. Use "" if not shown.
+  "dims"     — dimensions exactly as written. Use "" if none.
+  "material" — all material/fabric/finish notes for the same item joined with " | ". Use "" if none.
+  "page"     — use 1.
+
+Rules:
+- Extract only real product rows/items, not totals, headers, addresses, or payment terms.
+- If one product spans multiple lines, merge the lines into one item when possible.
+- If text is blurry or uncertain, still return the best guess, but do not invent values that are not visible.
+
+Return ONLY a valid JSON array. No markdown, no explanation.
+"""
+
 
 BATCH_SIZE = 3   # pages per Claude call — keeps token usage manageable
+
+
+def _parse_json_response(raw: str) -> list[dict]:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
+
+
+def _normalize_products(products: list[dict], source_type: str) -> list[dict]:
+    normalized = []
+    for p in products:
+        p.setdefault("area", "")
+        p.setdefault("code", "")
+        p.setdefault("product", "")
+        p.setdefault("qty", "")
+        p.setdefault("dims", "")
+        p.setdefault("material", "")
+        p.setdefault("page", 1)
+        p.setdefault("extra_materials", [])
+        p.setdefault("swatches", [])
+        p.setdefault("photo", None)
+        p.setdefault("y0", 0)
+        p.setdefault("y1", 0)
+        p["source_type"] = source_type
+        normalized.append(p)
+    return normalized
 
 
 def _call_claude_batch(client, page_images: list[tuple[int, bytes]]) -> list[dict]:
@@ -121,10 +170,7 @@ def _call_claude_batch(client, page_images: list[tuple[int, bytes]]) -> list[dic
             f"Stop reason: {resp.stop_reason}"
         )
 
-    raw = text_blocks[0].strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    return _parse_json_response(text_blocks[0])
 
 
 def claude_extract_all_pages(pdf_path: str) -> list[dict]:
@@ -156,21 +202,47 @@ def claude_extract_all_pages(pdf_path: str) -> list[dict]:
         products = _call_claude_batch(client, batch)
         all_products.extend(products)
 
-    for p in all_products:
-        p.setdefault("area", "")
-        p.setdefault("code", "")
-        p.setdefault("product", "")
-        p.setdefault("qty", "")
-        p.setdefault("dims", "")
-        p.setdefault("material", "")
-        p.setdefault("page", 1)
-        p["y0"] = 0
-        p["y1"] = 0
-        p["swatches"] = []
-        p["photo"] = None
-        p["extra_materials"] = []
+    return _normalize_products(all_products, source_type="pdf")
 
-    return all_products
+
+def claude_extract_from_image(image_path: str) -> list[dict]:
+    """
+    Extract products from a quote screenshot or photo.
+    This is less reliable than native PDF/Excel parsing, so downstream review is important.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+    suffix = os.path.splitext(image_path)[1].lower()
+    media_type = "image/png" if suffix == ".png" else "image/jpeg"
+    with open(image_path, "rb") as f:
+        img_b64 = base64.standard_b64encode(f.read()).decode()
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": img_b64,
+                    },
+                },
+                {"type": "text", "text": IMAGE_EXTRACT_PROMPT},
+            ],
+        }],
+    )
+
+    text_blocks = [b.text for b in resp.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(f"Claude returned no text. Stop reason: {resp.stop_reason}")
+    return _normalize_products(_parse_json_response(text_blocks[0]), source_type="image")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -373,6 +445,83 @@ def parse_dims(s: str) -> tuple[str, str, str]:
         return parts[0], parts[1], ""
 
     return s[:30] if s else "", "", ""
+
+
+def score_products(products: list[dict]) -> list[dict]:
+    """
+    Add lightweight review metadata so the UI can focus humans on risky rows.
+    This is heuristic, not model-native confidence.
+    """
+    for p in products:
+        reasons = []
+        score = 0.2
+
+        product = (p.get("product") or "").strip()
+        code = (p.get("code") or "").strip()
+        qty = (p.get("qty") or "").strip()
+        dims = (p.get("dims") or "").strip()
+        material = (p.get("material") or "").strip()
+        source_type = p.get("source_type", "")
+
+        if product:
+            score += 0.35
+        else:
+            reasons.append("Missing product name")
+
+        if qty:
+            score += 0.15
+        else:
+            reasons.append("Missing quantity")
+
+        if code:
+            score += 0.12
+        else:
+            reasons.append("Missing product code")
+
+        if dims:
+            score += 0.10
+            l, w, h = parse_dims(dims)
+            if not l:
+                reasons.append("Dimensions could not be split cleanly")
+            elif not (w or h):
+                reasons.append("Dimensions look incomplete")
+        else:
+            reasons.append("Missing dimensions")
+
+        if material:
+            score += 0.08
+        else:
+            reasons.append("Missing material / fabric")
+
+        if p.get("photo"):
+            score += 0.08
+        if p.get("swatches"):
+            score += 0.05
+        if source_type == "image":
+            score -= 0.10
+            reasons.append("Screenshot/photo input is OCR-sensitive")
+        elif source_type == "excel":
+            score += 0.05
+
+        product_len = len(product)
+        if 0 < product_len < 4:
+            reasons.append("Product name is very short")
+            score -= 0.08
+
+        if not code and not dims and not material:
+            reasons.append("Too little structured detail to trust auto-fill")
+            score -= 0.12
+
+        if not reasons:
+            reasons.append("Looks consistent")
+
+        confidence = max(0.0, min(score, 0.99))
+        p["confidence"] = round(confidence, 2)
+        p["review_reasons"] = reasons
+        p["needs_review"] = confidence < 0.75 or any(
+            reason.startswith("Missing") for reason in reasons
+        )
+    return products
 
 
 # ══════════════════════════════════════════════════════════════════════════════
