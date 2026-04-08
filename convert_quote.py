@@ -430,6 +430,14 @@ def _crop_looks_blank(pil_img: PILImage.Image) -> bool:
     return (high - low) < 12
 
 
+def _to_jpeg_bytes(pil_img: PILImage.Image) -> bytes:
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=88)
+    return buf.getvalue()
+
+
 def _attach_screenshot_row_photos(products: list[dict], raw_bytes: bytes) -> list[dict]:
     """
     Heuristic fallback for screenshot inputs that contain one product image per row.
@@ -453,9 +461,7 @@ def _attach_screenshot_row_photos(products: list[dict], raw_bytes: bytes) -> lis
         y1 = int(height * 0.82)
         crop = pil.crop((x0, y0, x1, y1))
         if not _crop_looks_blank(crop):
-            buf = io.BytesIO()
-            crop.save(buf, format="JPEG", quality=88)
-            products[0]["photo"] = buf.getvalue()
+            products[0]["photo"] = _to_jpeg_bytes(crop)
         return products
 
     x0 = int(width * 0.58)
@@ -470,9 +476,7 @@ def _attach_screenshot_row_photos(products: list[dict], raw_bytes: bytes) -> lis
         crop = pil.crop((x0, y0, x1, y1))
         if _crop_looks_blank(crop):
             continue
-        buf = io.BytesIO()
-        crop.save(buf, format="JPEG", quality=88)
-        product["photo"] = buf.getvalue()
+        product["photo"] = _to_jpeg_bytes(crop)
 
     return products
 
