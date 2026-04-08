@@ -455,24 +455,26 @@ def _attach_screenshot_row_photos(products: list[dict], raw_bytes: bytes) -> lis
     width, height = pil.size
     count = len(products)
     if count == 1:
-        x0 = int(width * 0.58)
-        x1 = int(width * 0.84)
+        x0 = int(width * 0.62)
+        x1 = int(width * 0.81)
         y0 = int(height * 0.18)
-        y1 = int(height * 0.82)
+        y1 = int(height * 0.90)
         crop = pil.crop((x0, y0, x1, y1))
         if not _crop_looks_blank(crop):
             products[0]["photo"] = _to_jpeg_bytes(crop)
         return products
 
-    x0 = int(width * 0.58)
-    x1 = int(width * 0.84)
+    # Screenshot quotes usually place the product picture in a dedicated image column.
+    # Keep the crop focused on that column and preserve most of each row height.
+    x0 = int(width * 0.62)
+    x1 = int(width * 0.81)
     content_top = int(height * 0.17)
     content_bottom = int(height * 0.86)
     row_h = max(1, (content_bottom - content_top) / count)
 
     for idx, product in enumerate(products):
-        y0 = int(content_top + idx * row_h + row_h * 0.08)
-        y1 = int(content_top + (idx + 1) * row_h - row_h * 0.08)
+        y0 = int(content_top + idx * row_h + row_h * 0.02)
+        y1 = int(content_top + (idx + 1) * row_h - row_h * 0.02)
         crop = pil.crop((x0, y0, x1, y1))
         if _crop_looks_blank(crop):
             continue
@@ -967,7 +969,7 @@ def write_excel(products, template_path, out_path):
         c.fill = TERMS_FILL; c.alignment = LEFT
         row += 1
 
-    ws.freeze_panes = "D11"
+    ws.freeze_panes = None
     ws.sheet_view.view = "normal"
     wb.save(out_path)
 
