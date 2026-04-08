@@ -6,7 +6,7 @@ Chinify Quote Converter — Claude Vision Primary Extraction
 - Supports multi-page PDFs, any column layout, any language
 """
 
-import os, re, io, json, base64, shutil, zipfile
+import os, re, io, json, base64, shutil, zipfile, unicodedata
 from datetime import date
 
 import fitz
@@ -151,6 +151,86 @@ def _parse_json_response(raw: str) -> list[dict]:
     return json.loads(raw)
 
 
+def _canonical_key(label: str) -> str:
+    text = unicodedata.normalize("NFKD", label or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-zA-Z0-9]+", "", text).lower()
+    return text
+
+
+def _key_to_standard_field(label: str) -> str | None:
+    key = _canonical_key(label)
+    alias_map = {
+        "clave": "code",
+        "codigo": "code",
+        "code": "code",
+        "sku": "code",
+        "ref": "code",
+        "reference": "code",
+        "nombre": "product",
+        "name": "product",
+        "product": "product",
+        "producto": "product",
+        "detalle": "detail",
+        "detail": "detail",
+        "descripcion": "detail",
+        "description": "detail",
+        "spec": "detail",
+        "specification": "detail",
+        "cantidad": "qty",
+        "cant": "qty",
+        "canttotal": "qty",
+        "qty": "qty",
+        "quantity": "qty",
+        "area": "area",
+        "ubicacion": "area",
+        "location": "area",
+        "colocacion": "area",
+        "medida": "dims",
+        "medidas": "dims",
+        "tamano": "dims",
+        "tamaño": "dims",
+        "dimension": "dims",
+        "dimensions": "dims",
+        "dim": "dims",
+        "material": "material",
+        "fabric": "material",
+        "tela": "material",
+    }
+    return alias_map.get(key)
+
+
+def _harmonize_product_fields(product: dict) -> None:
+    cleaned_extra = {}
+    extra_fields = product.get("extra_fields") or {}
+    if not isinstance(extra_fields, dict):
+        extra_fields = {}
+
+    candidate_items = list(extra_fields.items())
+    for key, val in list(product.items()):
+        if key in STANDARD_FIELDS:
+            continue
+        candidate_items.append((key, val))
+
+    for raw_key, raw_val in candidate_items:
+        value = "" if raw_val is None else str(raw_val).strip()
+        if not value:
+            continue
+
+        std_key = _key_to_standard_field(str(raw_key))
+        if std_key:
+            current = str(product.get(std_key, "") or "").strip()
+            if not current:
+                product[std_key] = value
+                continue
+            if current == value:
+                continue
+
+        cleaned_extra[str(raw_key).strip()] = value
+
+    product["extra_fields"] = cleaned_extra
+
+
 def _normalize_products(products: list[dict], source_type: str) -> list[dict]:
     normalized = []
     for p in products:
@@ -169,6 +249,7 @@ def _normalize_products(products: list[dict], source_type: str) -> list[dict]:
         p.setdefault("y0", 0)
         p.setdefault("y1", 0)
         p["source_type"] = source_type
+        _harmonize_product_fields(p)
         normalized.append(p)
     return normalized
 
@@ -275,9 +356,7 @@ def claude_extract_from_image(image_path: str) -> list[dict]:
     if not text_blocks:
         raise RuntimeError(f"Claude returned no text. Stop reason: {resp.stop_reason}")
     products = _normalize_products(_parse_json_response(text_blocks[0]), source_type="image")
-    if len(products) == 1 and not products[0].get("photo"):
-        products[0]["photo"] = raw_bytes
-    return products
+    return _attach_screenshot_row_photos(products, raw_bytes)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -340,6 +419,62 @@ def annotate_yranges(pdf_path: str, products: list[dict]) -> list[dict]:
 def _is_blank(pix, threshold=247):
     samples = pix.samples
     return (sum(samples) / len(samples)) > threshold
+
+
+def _crop_looks_blank(pil_img: PILImage.Image) -> bool:
+    gray = pil_img.convert("L")
+    extrema = gray.getextrema()
+    if not extrema:
+        return True
+    low, high = extrema
+    return (high - low) < 12
+
+
+def _attach_screenshot_row_photos(products: list[dict], raw_bytes: bytes) -> list[dict]:
+    """
+    Heuristic fallback for screenshot inputs that contain one product image per row.
+    Crops the likely image column and splits it by product order.
+    """
+    if not products:
+        return products
+    if any(p.get("photo") for p in products):
+        return products
+
+    pil = PILImage.open(io.BytesIO(raw_bytes))
+    if pil.mode not in ("RGB", "RGBA"):
+        pil = pil.convert("RGB")
+
+    width, height = pil.size
+    count = len(products)
+    if count == 1:
+        x0 = int(width * 0.58)
+        x1 = int(width * 0.84)
+        y0 = int(height * 0.18)
+        y1 = int(height * 0.82)
+        crop = pil.crop((x0, y0, x1, y1))
+        if not _crop_looks_blank(crop):
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=88)
+            products[0]["photo"] = buf.getvalue()
+        return products
+
+    x0 = int(width * 0.58)
+    x1 = int(width * 0.84)
+    content_top = int(height * 0.17)
+    content_bottom = int(height * 0.86)
+    row_h = max(1, (content_bottom - content_top) / count)
+
+    for idx, product in enumerate(products):
+        y0 = int(content_top + idx * row_h + row_h * 0.08)
+        y1 = int(content_top + (idx + 1) * row_h - row_h * 0.08)
+        crop = pil.crop((x0, y0, x1, y1))
+        if _crop_looks_blank(crop):
+            continue
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=88)
+        product["photo"] = buf.getvalue()
+
+    return products
 
 
 def extract_and_match_images(pdf_path: str, products: list[dict]) -> list[dict]:
@@ -611,6 +746,18 @@ def _collect_extra_columns(products: list[dict]) -> list[str]:
             if key not in STANDARD_FIELDS:
                 add_key(str(key))
 
+    preferred = {
+        "clave2": 0,
+        "model": 0,
+        "proveedor": 1,
+        "provider": 1,
+        "supplier": 1,
+        "remark": 2,
+        "remarks": 2,
+        "nota": 2,
+        "notes": 2,
+    }
+    ordered.sort(key=lambda label: (preferred.get(_canonical_key(label), 99), label.lower()))
     return ordered
 
 
