@@ -57,6 +57,29 @@ DARK_NORM  = Font(name="Calibri", color="1F3864", size=9)
 CENTER     = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT       = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
+STANDARD_FIELDS = {
+    "area",
+    "code",
+    "product",
+    "qty",
+    "dims",
+    "detail",
+    "material",
+    "page",
+    "extra_materials",
+    "extra_fields",
+    "swatches",
+    "photo",
+    "y0",
+    "y1",
+    "source_type",
+    "confidence",
+    "review_reasons",
+    "needs_review",
+    "_swatch",
+    "_extra",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1  Claude Vision — primary extraction from ALL pages (any PDF format)
@@ -73,8 +96,10 @@ Each item must have these exact fields:
   "area"     — room/zone name (e.g. "MINISTER OFFICE", "SALA", "TERRAZA"). Use "" if not shown.
   "dims"     — full dimension string exactly as written (e.g. "3000W x 400D x 780H CM",
                "OVERALL: 79W x 76D x 80H SEAT HEIGHT: 46CM", "45DIA X55H"). Use "" if none.
+  "detail"   — visible description/spec/detail text for this product. Use "" if none.
   "material" — all material notes for this product joined with " | "
                (e.g. "LEATHER: TO BE SELECT | WOOD: TO BE SELECT"). Use "" if none.
+  "extra_fields" — object of any other visible client-specific fields that do not fit the schema.
   "page"     — page number (1-indexed integer) where this item appears.
 
 Rules:
@@ -85,6 +110,7 @@ Rules:
 - Skip: column header rows, page footers, company notes, legal text.
 - "dims": copy the full dimension text exactly as written — do not reformat or shorten.
 - "material": join ALL material lines for that product row with " | ".
+- Put any additional client-only fields into "extra_fields" using the visible label as the key.
 
 Return ONLY a valid JSON array. No markdown, no explanation.
 """
@@ -100,13 +126,16 @@ Each item must have these exact fields:
   "qty"      — quantity as a string. Use "" if none.
   "area"     — room/zone name. Use "" if not shown.
   "dims"     — dimensions exactly as written. Use "" if none.
+  "detail"   — visible description/spec/detail text for this product. Use "" if none.
   "material" — all material/fabric/finish notes for the same item joined with " | ". Use "" if none.
+  "extra_fields" — object of any other visible client-specific fields that do not fit the schema.
   "page"     — use 1.
 
 Rules:
 - Extract only real product rows/items, not totals, headers, addresses, or payment terms.
 - If one product spans multiple lines, merge the lines into one item when possible.
 - If text is blurry or uncertain, still return the best guess, but do not invent values that are not visible.
+- Put any additional client-only fields into "extra_fields" using the visible label as the key.
 
 Return ONLY a valid JSON array. No markdown, no explanation.
 """
@@ -130,9 +159,11 @@ def _normalize_products(products: list[dict], source_type: str) -> list[dict]:
         p.setdefault("product", "")
         p.setdefault("qty", "")
         p.setdefault("dims", "")
+        p.setdefault("detail", "")
         p.setdefault("material", "")
         p.setdefault("page", 1)
         p.setdefault("extra_materials", [])
+        p.setdefault("extra_fields", {})
         p.setdefault("swatches", [])
         p.setdefault("photo", None)
         p.setdefault("y0", 0)
@@ -217,7 +248,8 @@ def claude_extract_from_image(image_path: str) -> list[dict]:
     suffix = os.path.splitext(image_path)[1].lower()
     media_type = "image/png" if suffix == ".png" else "image/jpeg"
     with open(image_path, "rb") as f:
-        img_b64 = base64.standard_b64encode(f.read()).decode()
+        raw_bytes = f.read()
+    img_b64 = base64.standard_b64encode(raw_bytes).decode()
 
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
@@ -242,7 +274,10 @@ def claude_extract_from_image(image_path: str) -> list[dict]:
     text_blocks = [b.text for b in resp.content if b.type == "text"]
     if not text_blocks:
         raise RuntimeError(f"Claude returned no text. Stop reason: {resp.stop_reason}")
-    return _normalize_products(_parse_json_response(text_blocks[0]), source_type="image")
+    products = _normalize_products(_parse_json_response(text_blocks[0]), source_type="image")
+    if len(products) == 1 and not products[0].get("photo"):
+        products[0]["photo"] = raw_bytes
+    return products
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -553,6 +588,40 @@ def _write_cell(ws, col, row, val, fill, font, alignment, border):
     c.alignment = alignment; c.border = border
 
 
+def _collect_extra_columns(products: list[dict]) -> list[str]:
+    ordered = []
+    seen = set()
+
+    def add_key(key: str):
+        label = (key or "").strip()
+        if not label:
+            return
+        if label in seen:
+            return
+        seen.add(label)
+        ordered.append(label)
+
+    for p in products:
+        extra_fields = p.get("extra_fields") or {}
+        if isinstance(extra_fields, dict):
+            for key in extra_fields.keys():
+                add_key(str(key))
+
+        for key in p.keys():
+            if key not in STANDARD_FIELDS:
+                add_key(str(key))
+
+    return ordered
+
+
+def _build_detail_text(product: dict) -> str:
+    detail = (product.get("detail") or "").strip()
+    material = (product.get("material") or "").strip()
+    if detail and material:
+        return f"{detail} | {material}"
+    return detail or material
+
+
 def write_excel(products, template_path, out_path):
     shutil.copy(template_path, out_path)
     wb = openpyxl.load_workbook(out_path)
@@ -568,12 +637,22 @@ def write_excel(products, template_path, out_path):
     for mr in to_unmerge:
         ws.unmerge_cells(mr)
 
+    extra_columns = _collect_extra_columns(products)
+    extra_start_idx = openpyxl.utils.column_index_from_string("Q")
+    extra_col_map = {
+        key: get_column_letter(extra_start_idx + idx)
+        for idx, key in enumerate(extra_columns)
+    }
+
+    for col in extra_col_map.values():
+        ws.column_dimensions[col].width = 18
+
     # Reset ALL cells rows 9-300 to plain white
     _blank = PatternFill("solid", fgColor="FFFFFF")
     _no_border = Border()
     for r in range(9, 301):
         ws.row_dimensions[r].height = ROW_H_TEXT
-        for c in range(1, 18):
+        for c in range(1, extra_start_idx + len(extra_columns)):
             cell = ws.cell(row=r, column=c)
             cell.value = None
             cell.fill  = _blank
@@ -584,7 +663,7 @@ def write_excel(products, template_path, out_path):
     ws.row_dimensions[9].height  = 26
     ws.row_dimensions[10].height = 20
     for r in (9, 10):
-        for c in range(1, 18):
+        for c in range(1, extra_start_idx + len(extra_columns)):
             ws.cell(row=r, column=c).fill = HEADER_FILL
 
     for col, lbl in {
@@ -609,6 +688,15 @@ def write_excel(products, template_path, out_path):
         c.value = lbl; c.font = WHITE_BOLD; c.fill = HEADER_FILL
         c.alignment = CENTER; c.border = bdr()
 
+    for key, col in extra_col_map.items():
+        ws.merge_cells(f"{col}9:{col}10")
+        c = ws[f"{col}9"]
+        c.value = str(key).upper()
+        c.font = WHITE_BOLD
+        c.fill = HEADER_FILL
+        c.alignment = CENTER
+        c.border = bdr()
+
     # Expand products with multiple swatches into separate rows
     rows_data = []
     for p in products:
@@ -627,36 +715,24 @@ def write_excel(products, template_path, out_path):
 
     # Product rows
     row       = 11
-    last_area = None
     alt       = 0
 
     for p in rows_data:
-        area = p.get("area", "")
-
-        if area and area != last_area and not p.get("_extra"):
-            ws.row_dimensions[row].height = 20
-            ws.merge_cells(f"B{row}:P{row}")
-            c = ws[f"B{row}"]
-            c.value = area
-            c.font  = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
-            c.fill  = PatternFill("solid", fgColor="2E5090")
-            c.alignment = LEFT; c.border = bdr()
-            last_area = area; row += 1; alt = 0
-
         fill = FILL_W if alt % 2 == 0 else FILL_B
         has_photo  = bool(p.get("photo"))
         has_swatch = bool(p.get("_swatch"))
         ws.row_dimensions[row].height = ROW_H_IMG if (has_photo or has_swatch) else ROW_H_TEXT
 
         l, w, h = parse_dims(p.get("dims", ""))
+        detail_text = _build_detail_text(p)
 
         data_cols = {
             "B": p.get("code",""),
-            "C": "" if not p.get("_extra") else "↑",
+            "C": "" if p.get("_extra") else p.get("area", ""),
             "D": p.get("product",""),
             "E": "",
             "F": l, "G": w, "H": h,
-            "I": p.get("material",""),
+            "I": detail_text,
             "J": p.get("qty",""),
             "K": "", "L": "", "M": "", "N": "", "O": "",
             "P": "",
@@ -665,6 +741,21 @@ def write_excel(products, template_path, out_path):
             c = ws[f"{col}{row}"]
             c.value = val; c.fill = fill; c.font = DARK_NORM; c.border = bdr()
             c.alignment = LEFT if col in ("D","I","P") else CENTER
+
+        extra_fields = p.get("extra_fields") or {}
+        for key, col in extra_col_map.items():
+            val = ""
+            if isinstance(extra_fields, dict) and key in extra_fields:
+                val = extra_fields.get(key, "")
+            elif key in p and key not in STANDARD_FIELDS:
+                val = p.get(key, "")
+
+            c = ws[f"{col}{row}"]
+            c.value = val
+            c.fill = fill
+            c.font = DARK_NORM
+            c.border = bdr()
+            c.alignment = LEFT
 
         # Furniture photo → FOTO/E
         if has_photo and not p.get("_extra"):
@@ -689,17 +780,21 @@ def write_excel(products, template_path, out_path):
     # TOTAL section
     for lbl in ["TOTAL", "SHIPPING", "TOTAL GENERAL"]:
         ws.row_dimensions[row].height = 22
-        ws.merge_cells(f"B{row}:J{row}")
+        total_end_col = get_column_letter(max(openpyxl.utils.column_index_from_string("J"), extra_start_idx + len(extra_columns) - 1))
+        ws.merge_cells(f"B{row}:{total_end_col}{row}")
         c = ws[f"B{row}"]
         c.value = lbl; c.font = DARK_BOLD; c.fill = TOTAL_FILL
         c.alignment = CENTER; c.border = bdr()
-        for col in "KLMNOP":
-            ws[f"{col}{row}"].fill = TOTAL_FILL; ws[f"{col}{row}"].border = bdr()
+        for cidx in range(openpyxl.utils.column_index_from_string("K"), extra_start_idx + len(extra_columns)):
+            col = get_column_letter(cidx)
+            ws[f"{col}{row}"].fill = TOTAL_FILL
+            ws[f"{col}{row}"].border = bdr()
         row += 1
 
     # Terms
     ws.row_dimensions[row].height = 22
-    ws.merge_cells(f"B{row}:P{row}")
+    terms_end_col = get_column_letter(max(openpyxl.utils.column_index_from_string("P"), extra_start_idx + len(extra_columns) - 1))
+    ws.merge_cells(f"B{row}:{terms_end_col}{row}")
     ws[f"B{row}"].value = "TÉRMINOS / 条款"
     ws[f"B{row}"].font  = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
     ws[f"B{row}"].fill  = HEADER_FILL; ws[f"B{row}"].alignment = LEFT
@@ -715,7 +810,7 @@ def write_excel(products, template_path, out_path):
         "7. Los productos son personalizados y no se devolverán salvo defectos de fabricación.",
     ]:
         ws.row_dimensions[row].height = 28
-        ws.merge_cells(f"B{row}:P{row}")
+        ws.merge_cells(f"B{row}:{terms_end_col}{row}")
         c = ws[f"B{row}"]
         c.value = term; c.font = Font(name="Calibri", size=8, color="555555")
         c.fill = TERMS_FILL; c.alignment = LEFT

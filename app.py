@@ -44,8 +44,10 @@ Each product object must have these fields:
   "code"      — product code / SKU (e.g. "SL-2023"). Use "" if none.
   "qty"       — quantity as a string (e.g. "2", "1 SET"). Use "" if none.
   "dims"      — dimensions (e.g. "2400×900×750"). Use "" if none.
+  "detail"    — visible description/spec/detail text. Use "" if none.
   "material"  — fabric / material code (e.g. "LP9086F-1"). Use "" if none.
   "extra_materials" — list of additional material codes for the same product (if any). Default [].
+  "extra_fields" — object of any other client-only columns that do not fit the schema.
 
 Rules:
 - Skip column headers, grand totals, shipping rows, payment terms, company addresses.
@@ -53,6 +55,7 @@ Rules:
 - If a product spans multiple rows (e.g. two fabric options), keep the first row as the
   main product and put additional material codes in "extra_materials".
 - Normalize dimensions to digits with × separator when possible.
+- Put any additional client-only fields into "extra_fields" using the visible label as the key.
 
 Return ONLY a valid JSON array. No markdown, no explanation.
 
@@ -111,8 +114,10 @@ def extract_from_excel(excel_path: str) -> list[dict]:
         p.setdefault("code", "")
         p.setdefault("qty", "")
         p.setdefault("dims", "")
+        p.setdefault("detail", "")
         p.setdefault("material", "")
         p.setdefault("extra_materials", [])
+        p.setdefault("extra_fields", {})
         p.setdefault("y0", 0)
         p.setdefault("y1", 0)
         p.setdefault("swatches", [])
