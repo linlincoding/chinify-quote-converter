@@ -148,7 +148,58 @@ def _parse_json_response(raw: str) -> list[dict]:
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to recover the first top-level JSON array/object from mixed model output.
+    start_positions = [pos for pos in (raw.find("["), raw.find("{")) if pos != -1]
+    if not start_positions:
+        raise
+    start = min(start_positions)
+
+    stack = []
+    in_string = False
+    escape = False
+    end = None
+    for idx, ch in enumerate(raw[start:], start=start):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            stack.append("]" if ch == "[" else "}")
+        elif ch in "]}":
+            if stack and ch == stack[-1]:
+                stack.pop()
+                if not stack:
+                    end = idx + 1
+                    break
+
+    candidate = raw[start:end].strip() if end else raw[start:].strip()
+    if candidate:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Common failure mode: truncated response with an unterminated tail item.
+    # Trim to the last complete object in a JSON array and close the array.
+    if candidate.startswith("["):
+        trimmed = re.sub(r",\s*\{[^\[]*$", "", candidate, flags=re.DOTALL).rstrip(", \n\r\t")
+        if not trimmed.endswith("]"):
+            trimmed += "]"
+        return json.loads(trimmed)
+
+    raise
 
 
 def _canonical_key(label: str) -> str:

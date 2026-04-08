@@ -24,6 +24,7 @@ from convert_quote import (
 
 import anthropic
 import openpyxl
+from json import JSONDecodeError
 
 # Fixed paths (relative to this file)
 _DIR = Path(__file__).parent
@@ -278,6 +279,12 @@ def main():
                     status.update(label="Conversion complete ✅", state="complete", expanded=False)
                 else:
                     status.update(label="Conversion failed ❌", state="error")
+            except JSONDecodeError:
+                status.update(label="AI output was truncated ❌", state="error")
+                st.error(
+                    "The AI returned incomplete structured data for this file. "
+                    "Please try converting again, or use a clearer crop/smaller screenshot."
+                )
             except Exception as e:
                 status.update(label=f"Error: {e}", state="error")
                 st.exception(e)
